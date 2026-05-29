@@ -1,0 +1,10 @@
+.git
+.github
+.env
+node_modules
+vendor
+terraform
+*.md
+*.pdf
+.DS_Store
+storage/logs/*.log

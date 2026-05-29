@@ -1,0 +1,191 @@
+name: Deploy Laravel to AWS
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: laravel-app
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ─── Job 1: Test ───────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo_mysql, pdo_sqlite, zip
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Install Node dependencies and build assets
+        run: npm ci && npm run build
+
+      - name: Copy .env
+        run: cp .env.example .env && php artisan key:generate
+
+      - name: Run tests
+        run: php artisan test
+
+  # ─── Job 2: Build & Push Docker Image ──────────────
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest || true
+          docker build \
+            --target production \
+            --cache-from $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Save image tag and ECR repo to SSM
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          aws ssm put-parameter \
+            --name "/laravel/deploy/previous-tag" \
+            --value "$(aws ssm get-parameter --name /laravel/deploy/current-tag --query Parameter.Value --output text 2>/dev/null || echo 'none')" \
+            --type String --overwrite
+          aws ssm put-parameter \
+            --name "/laravel/deploy/current-tag" \
+            --value "$IMAGE_TAG" \
+            --type String --overwrite
+          aws ssm put-parameter \
+            --name "/laravel/config/ecr-repo" \
+            --value "$ECR_REGISTRY/$ECR_REPOSITORY" \
+            --type String --overwrite
+
+  # ─── Job 3: Deploy (Zero Downtime via Instance Refresh) ──
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Update SSM image tag and Launch Template user_data
+        run: |
+          aws ssm put-parameter \
+            --name "/laravel/deploy/image-tag" \
+            --value "${{ env.IMAGE_TAG }}" \
+            --type String --overwrite
+
+          LT_ID=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names laravel-asg \
+            --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId' \
+            --output text)
+
+          USER_DATA_B64=$(base64 -w 0 < terraform/user_data.sh)
+
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --launch-template-id "$LT_ID" \
+            --source-version '$Latest' \
+            --launch-template-data "{\"UserData\":\"$USER_DATA_B64\"}" \
+            --query 'LaunchTemplateVersion.VersionNumber' --output text)
+
+          aws ec2 modify-launch-template \
+            --launch-template-id "$LT_ID" \
+            --default-version "$NEW_VERSION"
+
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name laravel-asg \
+            --launch-template "LaunchTemplateId=$LT_ID,Version=\$Latest"
+
+      - name: Start Instance Refresh (zero-downtime rolling deploy)
+        id: refresh
+        run: |
+          # Cancel any stuck in-progress refresh before starting a new one
+          EXISTING=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name laravel-asg \
+            --query "InstanceRefreshes[?Status=='InProgress'].InstanceRefreshId" \
+            --output text)
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+            echo "Cancelling existing refresh: $EXISTING"
+            aws autoscaling cancel-instance-refresh --auto-scaling-group-name laravel-asg || true
+            sleep 15
+          fi
+
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name laravel-asg \
+            --strategy Rolling \
+            --preferences '{"MinHealthyPercentage":100,"InstanceWarmup":60}' \
+            --query 'InstanceRefreshId' --output text)
+          echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for Instance Refresh to complete
+        run: |
+          bash scripts/healthcheck.sh "${{ steps.refresh.outputs.refresh_id }}"
+
+  # ─── Job 4: Post-Deploy Health Check ──────────────
+  health-check:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Check ALB health endpoint
+        run: |
+          ALB_URL=$(aws elbv2 describe-load-balancers \
+            --names laravel-alb \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          
+          for i in {1..20}; do
+            STATUS=$(curl -s -L -o /dev/null -w "%{http_code}" http://$ALB_URL/health)
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Health check passed!"
+              exit 0
+            fi
+            echo "Attempt $i failed (HTTP $STATUS), retrying..."
+            sleep 15
+          done
+          
+          echo "❌ Health check failed — triggering rollback"
+          bash scripts/rollback.sh
+          exit 1
